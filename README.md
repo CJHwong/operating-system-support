@@ -20,10 +20,10 @@ Run directly from GitHub without cloning:
 
 ```bash
 # Interactive mode
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py
+uvx --from git+https://github.com/CJHwong/operating-system-support oss
 
 # One-time query
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py "list files in current directory"
+uvx --from git+https://github.com/CJHwong/operating-system-support oss "list files in current directory"
 ```
 
 ### Method 1.5: Create an alias for easier usage
@@ -31,7 +31,7 @@ uvx --from git+https://github.com/CJHwong/operating-system-support oss.py "list 
 Add this to your shell profile (`.bashrc`, `.zshrc`, etc.):
 
 ```bash
-alias oss='uvx --from git+https://github.com/CJHwong/operating-system-support oss.py'
+alias oss='uvx --from git+https://github.com/CJHwong/operating-system-support oss'
 ```
 
 Then reload your shell or run `source ~/.zshrc` (or your shell's config file).
@@ -112,16 +112,16 @@ When running in interactive mode:
 
 ```bash
 # System information
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py "show me system info"
+uvx --from git+https://github.com/CJHwong/operating-system-support oss "show me system info"
 
 # File operations
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py "create a backup of important files"
+uvx --from git+https://github.com/CJHwong/operating-system-support oss "create a backup of important files"
 
 # Python calculations
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py "calculate the fibonacci sequence up to 100"
+uvx --from git+https://github.com/CJHwong/operating-system-support oss "calculate the fibonacci sequence up to 100"
 
 # Interactive mode
-uvx --from git+https://github.com/CJHwong/operating-system-support oss.py
+uvx --from git+https://github.com/CJHwong/operating-system-support oss
 ```
 
 ## Safety Features

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "ollama",
+#   "ollama>=0.5.3",
 # ]
 # ///
 import argparse
@@ -16,7 +16,8 @@ import os
 import platform
 import subprocess
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import ollama
 
@@ -467,7 +468,7 @@ class OSAgent:
             self._execute_single_query(user_query)
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description='An AI agent that can use tools to interact with the OS.')
     parser.add_argument(
         'query',
@@ -505,3 +506,7 @@ if __name__ == '__main__':
         quiet=args.quiet,
     )
     agent.run(initial_query=args.query)
+
+
+if __name__ == '__main__':
+    main()
