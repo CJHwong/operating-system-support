@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "operating-system-support"
-version = "0.1.0"
+version = "0.2.0"
 description = "An AI agent that can interact with your operating system using shell commands and Python execution"
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 authors = [
     { name = "CJHwong", email = "your-email@example.com" },
 ]
-keywords = ["ai", "agent", "ollama", "shell", "python", "automation"]
+keywords = ["ai", "agent", "llm", "shell", "python", "automation", "ollama", "gemini", "function-calling"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,6 +26,7 @@ classifiers = [
 
 dependencies = [
     "ollama>=0.5.3",
+    "google-genai>=1.42.0",
 ]
 
 [project.urls]

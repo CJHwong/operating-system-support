@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "ollama>=0.5.3",
+#   "google-genai>=1.42.0",
 # ]
 # ///
 import argparse
@@ -17,14 +18,69 @@ import platform
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import ollama
+from google import genai
+from google.genai import types
 
 DEFAULT_MODEL = 'gpt-oss'
 
 
-def tool(description: str, param_descriptions: dict[str, str] | None = None) -> Callable:
+# ============================================================================
+# Response Data Classes
+# ============================================================================
+
+
+@dataclass
+class ToolCall:
+    """Represents a tool/function call request from the AI."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ChatResponse:
+    """Standardized response format from AI providers."""
+
+    content: str = ''
+    tool_calls: list[ToolCall] | None = None
+
+    @property
+    def has_tool_calls(self) -> bool:
+        """Check if response contains tool calls."""
+        return self.tool_calls is not None and len(self.tool_calls) > 0
+
+    @property
+    def has_content(self) -> bool:
+        """Check if response contains text content."""
+        return self.content != ''
+
+
+# ============================================================================
+# Provider Enum
+# ============================================================================
+
+
+class Provider(Enum):
+    """Supported AI providers."""
+
+    OLLAMA = 'ollama'
+    GEMINI = 'gemini'
+
+
+# ============================================================================
+# Tool Decorator
+# ============================================================================
+
+
+def tool(
+    description: str, param_descriptions: dict[str, str] | None = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
     Decorator to mark a method as a tool with automatic JSON schema generation.
 
@@ -36,7 +92,7 @@ def tool(description: str, param_descriptions: dict[str, str] | None = None) -> 
     if param_descriptions is None:
         param_descriptions = {}
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         sig = inspect.signature(func)
         parameters = {}
         required = []
@@ -62,6 +118,15 @@ def tool(description: str, param_descriptions: dict[str, str] | None = None) -> 
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
+        # Build parameters schema - Gemini-friendly format
+        param_schema: dict[str, Any] = {
+            'type': 'object',
+            'properties': parameters,
+            'additionalProperties': False,  # Strict schema for Gemini compatibility
+        }
+        if required:  # Only add 'required' field if there are required parameters
+            param_schema['required'] = required
+
         setattr(
             func,
             '_tool_definition',
@@ -70,11 +135,7 @@ def tool(description: str, param_descriptions: dict[str, str] | None = None) -> 
                 'function': {
                     'name': func.__name__,
                     'description': description,
-                    'parameters': {
-                        'type': 'object',
-                        'properties': parameters,
-                        'required': required,
-                    },
+                    'parameters': param_schema,
                 },
             },
         )
@@ -82,6 +143,248 @@ def tool(description: str, param_descriptions: dict[str, str] | None = None) -> 
         return func
 
     return decorator
+
+
+# ============================================================================
+# AI Provider Clients
+# ============================================================================
+
+
+class OllamaClient:
+    """Client for Ollama using native ollama SDK."""
+
+    def __init__(self, model: str, verbose: bool = False):
+        """
+        Initialize Ollama client.
+
+        Args:
+            model: Model name (e.g., 'llama3.2', 'gpt-oss')
+            verbose: Enable verbose logging
+        """
+        self.model = model
+        self.verbose = verbose
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        """
+        Send chat request to Ollama.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            tools: Optional tool definitions for function calling
+
+        Returns:
+            ChatResponse object
+        """
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+            )
+            if self.verbose:
+                print('Ollama response:', response)
+
+            # Convert to ChatResponse
+            message = response['message']
+            content = message.get('content', '')
+
+            tool_calls = None
+            if message.get('tool_calls'):
+                tool_calls = [
+                    ToolCall(
+                        id=tc.get('id', ''),
+                        name=tc['function']['name'],
+                        arguments=json.loads(tc['function']['arguments'])
+                        if isinstance(tc['function']['arguments'], str)
+                        else tc['function']['arguments'],
+                    )
+                    for tc in message['tool_calls']
+                ]
+
+            return ChatResponse(content=content, tool_calls=tool_calls)
+
+        except Exception as e:
+            raise Exception(f'Ollama API error: {str(e)}')
+
+
+class GeminiClient:
+    """Client for Google Gemini using native google-genai SDK (v1.42+)."""
+
+    def __init__(self, model: str, api_key: str, verbose: bool = False):
+        """
+        Initialize Gemini client.
+
+        Args:
+            model: Model name (e.g., 'gemini-2.5-flash')
+            api_key: Google AI API key
+            verbose: Enable verbose logging
+        """
+        self.model_name = model
+        self.verbose = verbose
+        self.client = genai.Client(api_key=api_key)
+        self.system_instruction = None
+
+    def _convert_tools_to_gemini_format(self, tools: list[dict[str, Any]] | None) -> list[types.Tool] | None:
+        """Convert tool definitions to Gemini format."""
+        if not tools:
+            return None
+
+        function_declarations = []
+        for tool in tools:
+            if tool['type'] == 'function':
+                func_def = tool['function']
+                # Convert parameters dict to Schema object
+                params_dict = func_def['parameters']
+                schema = self._convert_dict_to_schema(params_dict)
+                # Create FunctionDeclaration using parameters with Schema type
+                func_decl = types.FunctionDeclaration(
+                    name=func_def['name'],
+                    description=func_def['description'],
+                    parameters=schema,
+                )
+                function_declarations.append(func_decl)
+
+        return [types.Tool(function_declarations=function_declarations)] if function_declarations else None
+
+    def _convert_dict_to_schema(self, schema_dict: dict[str, Any]) -> types.Schema:
+        """Convert a JSON schema dictionary to Gemini Schema type."""
+        # Map JSON schema types to Gemini Schema types
+        type_mapping = {
+            'object': types.Type.OBJECT,
+            'string': types.Type.STRING,
+            'integer': types.Type.INTEGER,
+            'number': types.Type.NUMBER,
+            'boolean': types.Type.BOOLEAN,
+            'array': types.Type.ARRAY,
+        }
+
+        schema_type = type_mapping.get(schema_dict.get('type', 'object').lower(), types.Type.OBJECT)
+
+        # Build properties if they exist
+        properties = {}
+        if 'properties' in schema_dict:
+            for prop_name, prop_schema in schema_dict['properties'].items():
+                properties[prop_name] = self._convert_dict_to_schema(prop_schema)
+
+        # Build the schema
+        return types.Schema(
+            type=schema_type,
+            description=schema_dict.get('description'),
+            properties=properties if properties else None,
+            required=schema_dict.get('required'),
+            items=self._convert_dict_to_schema(schema_dict['items']) if 'items' in schema_dict else None,
+        )
+
+    def _convert_messages_to_contents(self, messages: list[dict[str, Any]]) -> list[types.Content]:
+        """Convert message history to Gemini Content format."""
+        contents = []
+
+        for msg in messages:
+            role = msg['role']
+
+            if role == 'system':
+                # Store system instruction separately
+                self.system_instruction = msg['content']
+            elif role == 'user':
+                contents.append(types.Content(role='user', parts=[types.Part(text=msg['content'])]))
+            elif role == 'assistant':
+                # Assistant messages with optional tool calls
+                parts = []
+                if msg.get('content'):
+                    parts.append(types.Part(text=msg['content']))
+
+                if msg.get('tool_calls'):
+                    for tool_call in msg['tool_calls']:
+                        args = tool_call['function']['arguments']
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                        parts.append(types.Part.from_function_call(name=tool_call['function']['name'], args=args))
+
+                if parts:
+                    contents.append(types.Content(role='model', parts=parts))
+            elif role == 'tool':
+                # Tool result
+                result_data = json.loads(msg['content']) if isinstance(msg['content'], str) else msg['content']
+                contents.append(
+                    types.Content(
+                        role='user',
+                        parts=[
+                            types.Part.from_function_response(name=msg.get('name', 'unknown'), response=result_data)
+                        ],
+                    )
+                )
+
+        return contents
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        """
+        Send chat request to Gemini.
+
+        Args:
+            messages: List of message dicts
+            tools: Optional tool definitions
+
+        Returns:
+            ChatResponse object
+        """
+        try:
+            # Convert messages and tools
+            contents = self._convert_messages_to_contents(messages)
+            gemini_tools = self._convert_tools_to_gemini_format(tools)
+
+            # Build config - be explicit to avoid mypy type issues
+            config: types.GenerateContentConfig | None = None
+            if self.system_instruction and gemini_tools:
+                config = types.GenerateContentConfig(
+                    system_instruction=self.system_instruction,
+                    tools=gemini_tools,  # type: ignore[arg-type]
+                )
+            elif self.system_instruction:
+                config = types.GenerateContentConfig(system_instruction=self.system_instruction)
+            elif gemini_tools:
+                config = types.GenerateContentConfig(tools=gemini_tools)  # type: ignore[arg-type]
+
+            # Generate content
+            response = self.client.models.generate_content(model=self.model_name, contents=contents, config=config)  # type: ignore[arg-type]
+
+            if self.verbose:
+                print('Gemini response:', response)
+
+            # Extract text content and function calls manually from parts
+            # This avoids the warning when accessing response.text with function calls present
+            content = ''
+            tool_calls = None
+
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                text_parts = []
+                extracted_calls = []
+
+                for i, part in enumerate(response.candidates[0].content.parts):
+                    if part.text:
+                        text_parts.append(part.text)
+                    elif part.function_call:
+                        fc = part.function_call
+                        # Add null checks for name and args
+                        if fc.name and fc.args is not None:
+                            extracted_calls.append(ToolCall(id=f'call_{i}', name=fc.name, arguments=dict(fc.args)))
+
+                # Combine text parts if any
+                if text_parts:
+                    content = ''.join(text_parts)
+
+                # Set tool_calls if any
+                if extracted_calls:
+                    tool_calls = extracted_calls
+
+            return ChatResponse(content=content, tool_calls=tool_calls)
+
+        except Exception as e:
+            raise Exception(f'Gemini API error: {str(e)}')
+
+
+# ============================================================================
+# Tool Management
+# ============================================================================
 
 
 class ToolRegistry:
@@ -102,7 +405,7 @@ class ToolRegistry:
                 self._definitions.append(getattr(method, '_tool_definition'))
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions for Ollama."""
+        """Get all tool definitions for the API."""
         return self._definitions
 
     def execute_tool(self, tool_name: str, **kwargs) -> dict[str, Any]:
@@ -111,6 +414,11 @@ class ToolRegistry:
             return self.tools[tool_name](**kwargs)
         else:
             return {'error': f'Tool `{tool_name}` not found.'}
+
+
+# ============================================================================
+# Command Approval
+# ============================================================================
 
 
 class CommandApprover:
@@ -186,14 +494,38 @@ class CommandApprover:
             print('Cleared all auto-approvals')
 
 
-class ConversationManager:
-    """Manages conversation messages and Ollama integration."""
+# ============================================================================
+# Conversation Management
+# ============================================================================
 
-    def __init__(self, model: str, fast_model: str | None = None, verbose: bool = False):
+
+class ConversationManager:
+    """Manages conversation messages and AI provider integration."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        model: str,
+        fast_model: str | None = None,
+        verbose: bool = False,
+        api_key: str | None = None,
+    ):
+        self.provider = provider
         self.model = model
         self.fast_model = fast_model or model
         self.verbose = verbose
         self.messages: list[dict[str, Any]] = []
+
+        # Create appropriate client based on provider
+        self.client: OllamaClient | GeminiClient
+        if provider == Provider.OLLAMA:
+            self.client = OllamaClient(model=model, verbose=verbose)
+        elif provider == Provider.GEMINI:
+            if not api_key:
+                raise ValueError('API key required for Gemini provider')
+            self.client = GeminiClient(model=model, api_key=api_key, verbose=verbose)
+        else:
+            raise ValueError(f'Unsupported provider: {provider}')
 
     def initialize_conversation(self, system_message: str):
         """Initialize the conversation with a system message."""
@@ -205,28 +537,37 @@ class ConversationManager:
 
     def add_assistant_message(self, content: str, tool_calls: list | None = None):
         """Add an assistant message to the conversation."""
-        message: dict[str, Any] = {'role': 'assistant', 'content': content}
+        message: dict[str, Any] = {'role': 'assistant'}
+        # Only add content if it's non-empty
+        if content:
+            message['content'] = content
         if tool_calls:
             message['tool_calls'] = tool_calls
         self.messages.append(message)
 
-    def add_tool_result(self, result: dict[str, Any]):
+    def add_tool_result(self, tool_call_id: str, tool_name: str, result: dict[str, Any]):
         """Add a tool result to the conversation."""
-        self.messages.append({'role': 'tool', 'content': json.dumps(result)})
+        self.messages.append(
+            {
+                'role': 'tool',
+                'tool_call_id': tool_call_id,
+                'name': tool_name,  # Gemini needs the function name
+                'content': json.dumps(result),
+            }
+        )
 
     def chat_with_tools(self, tool_definitions: list[dict[str, Any]]):
-        """Send the conversation to Ollama with tool definitions."""
+        """Send the conversation to the API with tool definitions."""
         try:
-            response = ollama.chat(
-                model=self.model,
+            response = self.client.chat(
                 messages=self.messages,
                 tools=tool_definitions,
             )
             if self.verbose:
-                print('Ollama response:', response)
+                print('API response:', response)
             return response
         except Exception as e:
-            raise Exception(f'Error during Ollama chat: {e}')
+            raise Exception(f'Error during API chat: {e}')
 
     def rewrite_query(self, query: str) -> str:
         """Use fast model to rewrite user query as clear instruction."""
@@ -240,11 +581,10 @@ class ConversationManager:
             'User query: ' + query
         )
         try:
-            response = ollama.chat(
-                model=self.fast_model,
+            response = self.client.chat(
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            rewritten = response['message']['content'].strip()
+            rewritten = response.content.strip() if response.has_content else query
             if self.verbose:
                 print('Original query:', query)
                 print('Rewritten query:', rewritten)
@@ -254,17 +594,36 @@ class ConversationManager:
             return query  # Fallback to original if error
 
 
+# ============================================================================
+# Main Agent
+# ============================================================================
+
+
 class OSAgent:
     """Main agent class that orchestrates tool execution and conversation."""
 
-    def __init__(self, model: str, fast_model: str | None = None, verbose: bool = False, quiet: bool = False):
+    def __init__(
+        self,
+        provider: Provider,
+        model: str,
+        fast_model: str | None = None,
+        verbose: bool = False,
+        quiet: bool = False,
+        api_key: str | None = None,
+    ):
         self.verbose = verbose
         self.quiet = quiet
 
         # Initialize helper components
         self.tool_registry = ToolRegistry()
         self.command_approver = CommandApprover(quiet=quiet)
-        self.conversation_manager = ConversationManager(model, fast_model, verbose)
+        self.conversation_manager = ConversationManager(
+            provider=provider,
+            model=model,
+            fast_model=fast_model,
+            verbose=verbose,
+            api_key=api_key,
+        )
 
         # Initialize conversation with system message
         system_message = (
@@ -400,30 +759,42 @@ class OSAgent:
             except Exception as e:
                 return 1, str(e)
 
-            response_message = response['message']
-
-            if not response_message.get('tool_calls'):
-                self.conversation_manager.add_assistant_message(response_message['content'])
-                return 0, response_message['content']
+            # Check if we have tool calls
+            if not response.has_tool_calls:
+                # No tool calls - return the content
+                if not response.has_content:
+                    error_msg = 'API returned empty response'
+                    return 1, error_msg
+                self.conversation_manager.add_assistant_message(response.content)
+                return 0, response.content
 
             # Handle tool calls
-            self.conversation_manager.add_assistant_message(
-                response_message['content'], response_message.get('tool_calls')
-            )
+            # Convert tool calls back to dict format for add_assistant_message
+            # Keep arguments as dict for Ollama, Gemini converts in _convert_messages_to_contents
+            tool_calls = response.tool_calls or []
+            tool_calls_dict = [
+                {
+                    'id': tc.id,
+                    'type': 'function',
+                    'function': {
+                        'name': tc.name,
+                        'arguments': tc.arguments,  # Keep as dict, don't stringify
+                    },
+                }
+                for tc in tool_calls
+            ]
 
-            tool_calls = response_message['tool_calls']
+            self.conversation_manager.add_assistant_message(response.content, tool_calls_dict)
+
             for tool_call in tool_calls:
                 if self.verbose:
-                    self._print_output(f'Tool call: {tool_call}')
+                    self._print_output(f'Tool call: {tool_call.name}({tool_call.arguments})')
 
-                tool_name = tool_call['function']['name']
-                tool_args = tool_call['function']['arguments']
+                tool_output = self.tool_registry.execute_tool(tool_call.name, **tool_call.arguments)
+                self.conversation_manager.add_tool_result(tool_call.id, tool_call.name, tool_output)
 
-                tool_output = self.tool_registry.execute_tool(tool_name, **tool_args)
-                self.conversation_manager.add_tool_result(tool_output)
-
-                if 'error' in tool_output and tool_name not in self.tool_registry.tools:
-                    self._print_output(f'Unknown tool: {tool_name}', to_stderr=True)
+                if 'error' in tool_output and tool_call.name not in self.tool_registry.tools:
+                    self._print_output(f'Unknown tool: {tool_call.name}', to_stderr=True)
 
     def _execute_single_query(self, user_query: str):
         """Execute a single query with preprocessing and output handling."""
@@ -468,8 +839,15 @@ class OSAgent:
             self._execute_single_query(user_query)
 
 
+# ============================================================================
+# CLI Entry Point
+# ============================================================================
+
+
 def main():
-    parser = argparse.ArgumentParser(description='An AI agent that can use tools to interact with the OS.')
+    parser = argparse.ArgumentParser(
+        description='An AI agent that can use tools to interact with the OS using Ollama or Gemini.'
+    )
     parser.add_argument(
         'query',
         nargs='?',
@@ -489,10 +867,22 @@ def main():
         help='Suppress all output except the final result.',
     )
     parser.add_argument(
+        '-p',
+        '--provider',
+        choices=['ollama', 'gemini'],
+        default='ollama',
+        help='AI provider to use (default: ollama).',
+    )
+    parser.add_argument(
         '-m',
         '--model',
         default=DEFAULT_MODEL,
-        help=f'Model to use (default: {DEFAULT_MODEL}).',
+        help=f'Model to use (default: {DEFAULT_MODEL} for Ollama, gemini-flash-latest for Gemini).',
+    )
+    parser.add_argument(
+        '--api-key',
+        default=None,
+        help='API key for Gemini provider. Not needed for Ollama.',
     )
     args = parser.parse_args()
 
@@ -500,10 +890,27 @@ def main():
     if args.quiet and args.query is None:
         parser.error('--quiet/-q can only be used with a query argument. Use interactive mode without --quiet.')
 
+    # Convert provider string to enum
+    provider = Provider.OLLAMA if args.provider == 'ollama' else Provider.GEMINI
+
+    # Set default model based on provider if not specified
+    model = args.model
+    fast_model = model
+    if model == DEFAULT_MODEL and provider == Provider.GEMINI:
+        model = 'gemini-flash-latest'
+        fast_model = 'gemini-flash-lite-latest'
+
+    # Validate Gemini API key
+    if provider == Provider.GEMINI and not args.api_key:
+        parser.error('Gemini provider requires --api-key environment variable.')
+
     agent = OSAgent(
-        model=args.model,
+        provider=provider,
+        model=model,
+        fast_model=fast_model,
         verbose=args.verbose,
         quiet=args.quiet,
+        api_key=args.api_key,
     )
     agent.run(initial_query=args.query)
 

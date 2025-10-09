@@ -1,8 +1,11 @@
 # Operating System Support
 
-OSS uses [gpt-oss](https://openai.com/index/introducing-gpt-oss/) for AI-driven interactions with the operating system.
+OSS is an AI agent for interacting with your operating system through shell commands and Python execution.
 
-It can use shell commands and execute Python scripts. Built with [Ollama](https://ollama.ai/) for local AI inference.
+Supports two AI providers:
+
+- [Ollama](https://ollama.ai/) (default, local)
+- [Google Gemini](https://ai.google.dev/gemini-api) (cloud)
 
 ## Features
 
@@ -77,27 +80,43 @@ chmod +x oss.py
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) - Python package manager
-- [Ollama](https://ollama.ai/) with the `gpt-oss` model installed
+- An AI provider (choose one):
+  - **Ollama** (Local, free): Install from <https://ollama.ai/> and pull a model like `ollama pull gpt-oss`
+  - **Google Gemini** (Cloud, free tier available): Get an API key from <https://aistudio.google.com/apikey>
 
-### Setting up Ollama
+### Quick Setup Examples
 
-1. Install Ollama from <https://ollama.ai/>
-2. Install the required model:
+#### Using Ollama (Local, Default)
 
 ```bash
-ollama pull gpt-oss
+# Install and start Ollama
+ollama pull gpt-oss  # or llama3.2, mistral, etc.
+
+# Run OSS (uses Ollama by default)
+uvx --from git+https://github.com/CJHwong/operating-system-support oss "list files"
+```
+
+#### Using Google Gemini
+
+```bash
+# Get your API key from https://aistudio.google.com/apikey
+
+# Run OSS with Gemini
+uvx --from git+https://github.com/CJHwong/operating-system-support oss -p gemini --api-key "your-key-here" "list files"
 ```
 
 ## Command Line Options
 
-```bash
+```plaintext
 oss.py [OPTIONS] [QUERY]
 
 Options:
-  -m, --model MODEL    Model to use (default: gpt-oss)
-  -v, --verbose        Enable verbose mode for debugging
-  -q, --quiet          Suppress all output except results (query mode only)
-  -h, --help           Show help message
+  -p, --provider PROVIDER   AI provider to use: ollama or gemini (default: ollama)
+  -m, --model MODEL         Model to use (default: gpt-oss for Ollama, gemini-flash-latest for Gemini)
+  --api-key KEY             API key for Gemini provider (not needed for Ollama)
+  -v, --verbose             Enable verbose mode for debugging
+  -q, --quiet               Suppress all output except results
+  -h, --help                Show help message
 ```
 
 ## Interactive Mode Commands
