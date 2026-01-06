@@ -23,7 +23,9 @@ from enum import Enum
 from typing import Any
 
 import ollama
+from ollama import ResponseError as OllamaResponseError
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 DEFAULT_MODEL = 'gpt-oss'
@@ -203,8 +205,14 @@ class OllamaClient:
 
             return ChatResponse(content=content, tool_calls=tool_calls)
 
+        except OllamaResponseError as e:
+            raise Exception(f'Ollama API error: {str(e)}') from e
+        except ConnectionError as e:
+            raise Exception(f'Ollama connection failed. Is Ollama running? Error: {str(e)}') from e
+        except TimeoutError as e:
+            raise Exception(f'Ollama request timed out: {str(e)}') from e
         except Exception as e:
-            raise Exception(f'Ollama API error: {str(e)}')
+            raise Exception(f'Unexpected Ollama error ({type(e).__name__}): {str(e)}') from e
 
 
 class GeminiClient:
@@ -378,8 +386,14 @@ class GeminiClient:
 
             return ChatResponse(content=content, tool_calls=tool_calls)
 
+        except genai_errors.APIError as e:
+            raise Exception(f'Gemini API error: {str(e)}') from e
+        except genai_errors.AuthenticationError as e:
+            raise Exception(f'Gemini authentication failed. Check your API key. Error: {str(e)}') from e
+        except TimeoutError as e:
+            raise Exception(f'Gemini request timed out: {str(e)}') from e
         except Exception as e:
-            raise Exception(f'Gemini API error: {str(e)}')
+            raise Exception(f'Unexpected Gemini error ({type(e).__name__}): {str(e)}') from e
 
 
 # ============================================================================
@@ -556,7 +570,7 @@ class ConversationManager:
             }
         )
 
-    def chat_with_tools(self, tool_definitions: list[dict[str, Any]]):
+    def chat_with_tools(self, tool_definitions: list[dict[str, Any]]) -> ChatResponse:
         """Send the conversation to the API with tool definitions."""
         try:
             response = self.client.chat(
@@ -567,7 +581,8 @@ class ConversationManager:
                 print('API response:', response)
             return response
         except Exception as e:
-            raise Exception(f'Error during API chat: {e}')
+            # Re-raise with context; underlying client exceptions are already informative
+            raise Exception(f'Chat API call failed: {e}') from e
 
     def rewrite_query(self, query: str) -> str:
         """Use fast model to rewrite user query as clear instruction."""
@@ -590,8 +605,9 @@ class ConversationManager:
                 print('Rewritten query:', rewritten)
             return rewritten
         except Exception as e:
-            print(f'Error during preprocessing: {e}')
-            return query  # Fallback to original if error
+            # Log to stderr and fallback gracefully - preprocessing is non-critical
+            print(f'Query preprocessing failed ({type(e).__name__}): {e}', file=sys.stderr)
+            return query
 
 
 # ============================================================================
@@ -691,7 +707,17 @@ class OSAgent:
 
     @tool('Execute a shell command.', {'command': 'The shell command to execute.'})
     def run_shell_command(self, command: str) -> dict:
-        """Execute a shell command with user confirmation."""
+        """Execute a shell command with user confirmation.
+
+        Security Model:
+        - Uses shell=True to support full shell syntax (pipes, redirects, etc.)
+        - User confirmation is REQUIRED before execution (primary security control)
+        - Commands are displayed to user exactly as they will be executed
+        - Auto-approval is per-command-base (e.g., 'ls' approved ≠ 'rm' approved)
+
+        Warning: This executes arbitrary shell commands. The user confirmation
+        prompt is the security boundary. Review commands carefully before approval.
+        """
         print(f'\n>>> Bash({command})')
         if not self.command_approver.confirm_command(command):
             return {'error': 'Command cancelled by user'}
@@ -881,8 +907,8 @@ def main():
     )
     parser.add_argument(
         '--api-key',
-        default=None,
-        help='API key for Gemini provider. Not needed for Ollama.',
+        default=os.environ.get('GEMINI_API_KEY'),
+        help='API key for Gemini provider. Can also be set via GEMINI_API_KEY env var. Not needed for Ollama.',
     )
     args = parser.parse_args()
 
@@ -902,7 +928,7 @@ def main():
 
     # Validate Gemini API key
     if provider == Provider.GEMINI and not args.api_key:
-        parser.error('Gemini provider requires --api-key environment variable.')
+        parser.error('Gemini provider requires an API key. Use --api-key or set GEMINI_API_KEY env var.')
 
     agent = OSAgent(
         provider=provider,
