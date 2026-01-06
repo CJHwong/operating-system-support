@@ -101,7 +101,11 @@ uvx --from git+https://github.com/CJHwong/operating-system-support oss "list fil
 ```bash
 # Get your API key from https://aistudio.google.com/apikey
 
-# Run OSS with Gemini
+# Option 1: Use environment variable (recommended - keeps key out of shell history)
+export GOOGLE_API_KEY="your-key-here"
+uvx --from git+https://github.com/CJHwong/operating-system-support oss -p gemini "list files"
+
+# Option 2: Pass key directly (visible in shell history and process list)
 uvx --from git+https://github.com/CJHwong/operating-system-support oss -p gemini --api-key "your-key-here" "list files"
 ```
 
@@ -143,12 +147,72 @@ uvx --from git+https://github.com/CJHwong/operating-system-support oss "calculat
 uvx --from git+https://github.com/CJHwong/operating-system-support oss
 ```
 
-## Safety Features
+## Security Considerations
 
-- All commands require user confirmation before execution
-- Auto-approval system for repeated safe commands  
-- Separate confirmation for Python code execution
-- Clear output formatting to show what's being executed
+### Command Execution
+
+- **All commands require user confirmation** before execution - this is the primary security boundary
+- Commands are displayed exactly as they will be executed - review them carefully
+- Auto-approval is per-command-base (e.g., approving `ls` does NOT approve `rm`)
+- Python code execution uses restricted builtins (imports blocked by default)
+
+### API Key Security
+
+- **Prefer environment variables** over command-line `--api-key` flag
+- Command-line arguments are visible in shell history (`~/.bash_history`, `~/.zsh_history`)
+- Command-line arguments are visible in process listings (`ps aux`)
+- Set `GOOGLE_API_KEY` in your shell profile or use a secrets manager
+
+### Limitations
+
+- This tool executes arbitrary shell commands and Python code on your system
+- The AI may suggest dangerous commands - always review before approving
+- Not suitable for unattended/automated execution without additional safeguards
+- Defense-in-depth measures exist but user confirmation is the primary control
+
+## Troubleshooting
+
+### Ollama Issues
+
+**"Ollama connection failed. Is Ollama running?"**
+
+- Ensure Ollama is installed and running: `ollama serve`
+- Check if the model exists: `ollama list`
+- Pull the model if needed: `ollama pull gpt-oss` (or your chosen model)
+
+**"Unexpected Ollama error"**
+
+- Check Ollama logs for details
+- Ensure you have enough memory for the model
+- Try a smaller model if resources are constrained
+
+### Gemini Issues
+
+**"Gemini authentication failed"**
+
+- Verify your API key is correct
+- Check if the key has been revoked at https://aistudio.google.com/apikey
+- Ensure the `GOOGLE_API_KEY` environment variable is set correctly
+
+**"Gemini request timed out"**
+
+- Check your internet connection
+- The Gemini API may be experiencing issues - try again later
+- Consider using Ollama for local operation
+
+### General Issues
+
+**"Maximum tool call iterations reached"**
+
+- The AI entered a loop calling tools repeatedly
+- This is a safety limit (default: 50 iterations)
+- Rephrase your query to be more specific
+
+**Python code shows "Blocked operation"**
+
+- Some functions are restricted for safety (e.g., `import`, `open`, `eval`)
+- The restricted environment blocks potentially dangerous operations
+- If you need these operations, use shell commands instead
 
 ## License
 
