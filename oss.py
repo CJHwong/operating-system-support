@@ -24,6 +24,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from types import FunctionType
 from typing import Any, Protocol
 
 import ollama
@@ -148,9 +149,7 @@ class ExecSandbox:
 # ============================================================================
 
 
-def tool(
-    description: str, param_descriptions: dict[str, str] | None = None
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def tool(description: str, param_descriptions: dict[str, str] | None = None) -> Callable[[FunctionType], FunctionType]:
     """
     Decorator to mark a method as a tool with automatic JSON schema generation.
 
@@ -162,7 +161,7 @@ def tool(
     if param_descriptions is None:
         param_descriptions = {}
 
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+    def decorator(func: FunctionType) -> FunctionType:
         sig = inspect.signature(func)
         parameters = {}
         required = []
@@ -197,16 +196,12 @@ def tool(
         if required:  # Only add 'required' field if there are required parameters
             param_schema['required'] = required
 
-        setattr(
+        setattr(  # noqa: B010
             func,
             '_tool_definition',
             {
                 'type': 'function',
-                'function': {
-                    'name': func.__name__,
-                    'description': description,
-                    'parameters': param_schema,
-                },
+                'function': {'name': func.__name__, 'description': description, 'parameters': param_schema},
             },
         )
 
@@ -274,13 +269,13 @@ class OllamaClient:
             return ChatResponse(content=content, tool_calls=tool_calls)
 
         except OllamaResponseError as e:
-            raise Exception(f'Ollama API error: {str(e)}') from e
+            raise Exception(f'Ollama API error: {e!s}') from e
         except ConnectionError as e:
-            raise Exception(f'Ollama connection failed. Is Ollama running? Error: {str(e)}') from e
+            raise Exception(f'Ollama connection failed. Is Ollama running? Error: {e!s}') from e
         except TimeoutError as e:
-            raise Exception(f'Ollama request timed out: {str(e)}') from e
+            raise Exception(f'Ollama request timed out: {e!s}') from e
         except Exception as e:
-            raise Exception(f'Unexpected Ollama error ({type(e).__name__}): {str(e)}') from e
+            raise Exception(f'Unexpected Ollama error ({type(e).__name__}): {e!s}') from e
 
 
 class GeminiClient:
@@ -300,7 +295,7 @@ class GeminiClient:
         self.client = genai.Client(api_key=api_key)
         self.system_instruction = None
 
-    def _convert_tools_to_gemini_format(self, tools: list[dict[str, Any]] | None) -> list[types.Tool] | None:
+    def _convert_tools_to_gemini_format(self, tools: list[dict[str, Any]] | None) -> types.ToolListUnion | None:
         """Convert tool definitions to Gemini format."""
         if not tools:
             return None
@@ -413,15 +408,15 @@ class GeminiClient:
             if self.system_instruction and gemini_tools:
                 config = types.GenerateContentConfig(
                     system_instruction=self.system_instruction,
-                    tools=gemini_tools,  # type: ignore[arg-type]
+                    tools=gemini_tools,
                 )
             elif self.system_instruction:
                 config = types.GenerateContentConfig(system_instruction=self.system_instruction)
             elif gemini_tools:
-                config = types.GenerateContentConfig(tools=gemini_tools)  # type: ignore[arg-type]
+                config = types.GenerateContentConfig(tools=gemini_tools)
 
             # Generate content
-            response = self.client.models.generate_content(model=self.model_name, contents=contents, config=config)  # type: ignore[arg-type]
+            response = self.client.models.generate_content(model=self.model_name, contents=contents, config=config)
 
             if self.verbose:
                 print('Gemini response:', response)
@@ -455,13 +450,13 @@ class GeminiClient:
             return ChatResponse(content=content, tool_calls=tool_calls)
 
         except genai_errors.APIError as e:
-            raise Exception(f'Gemini API error: {str(e)}') from e
-        except genai_errors.AuthenticationError as e:
-            raise Exception(f'Gemini authentication failed. Check your API key. Error: {str(e)}') from e
+            raise Exception(f'Gemini API error: {e!s}') from e
+        except genai_errors.ClientError as e:
+            raise Exception(f'Gemini client error (check your API key if 401/403). Error: {e!s}') from e
         except TimeoutError as e:
-            raise Exception(f'Gemini request timed out: {str(e)}') from e
+            raise Exception(f'Gemini request timed out: {e!s}') from e
         except Exception as e:
-            raise Exception(f'Unexpected Gemini error ({type(e).__name__}): {str(e)}') from e
+            raise Exception(f'Unexpected Gemini error ({type(e).__name__}): {e!s}') from e
 
 
 # ============================================================================
@@ -484,7 +479,7 @@ class ToolRegistry:
         for name, method in inspect.getmembers(instance, inspect.ismethod):
             if hasattr(method, '_tool_definition'):
                 self.tools[name] = method
-                self._definitions.append(getattr(method, '_tool_definition'))
+                self._definitions.append(method._tool_definition)
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions for the API."""
@@ -1051,7 +1046,7 @@ class OSAgent:
                 text=True,
             )
         except Exception as e:
-            error_msg = f'Command execution error: {str(e)}'
+            error_msg = f'Command execution error: {e!s}'
             self._print_tool_output(error_msg)
             return {'error': str(e)}
 
@@ -1072,7 +1067,7 @@ class OSAgent:
     @tool('Execute Python code.', {'code': 'The Python code to execute.'})
     def python_interpreter(self, code: str) -> dict:
         """Execute Python code with user confirmation."""
-        print(f'\n>>> {self.sandbox.label}({repr(code)})')
+        print(f'\n>>> {self.sandbox.label}({code!r})')
         if not self.command_approver.confirm_python_code():
             return {'error': 'Command cancelled by user'}
 
@@ -1141,7 +1136,7 @@ class OSAgent:
                 print(response)
 
         except Exception as e:
-            print(f'Error: {str(e)}', file=sys.stderr)
+            print(f'Error: {e!s}', file=sys.stderr)
 
     def run(self, initial_query: str | None = None):
         """Main execution loop for the agent."""

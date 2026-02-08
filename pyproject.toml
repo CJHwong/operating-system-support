@@ -38,6 +38,43 @@ Issues = "https://github.com/CJHwong/operating-system-support/issues"
 [project.scripts]
 oss = "oss:main"
 
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle error
+    "F",   # Pyflakes
+    "W",   # pycodestyle warning
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific
+    "TID", # flake8-tidy-imports
+    "PYI", # type hinting
+]
+ignore = [
+    "F403", # unable to detect undefined names
+    "F405", # may be undefined, or defined from star imports
+    "E402", # module level import not at top of file
+    "E501", # line too long
+    "E722", # do not use bare `except`
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ty.environment]
+python = ".venv"
+
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 include = ["oss.py"]
