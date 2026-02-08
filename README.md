@@ -11,6 +11,7 @@ Supports two AI providers:
 
 - Execute shell commands with user confirmation
 - Run Python code interactively
+- **Monty sandbox** for safe Python execution (no filesystem, no imports, resource limits)
 - Auto-approval system for repeated commands
 - Built-in query preprocessing for better AI understanding
 - Tool-based architecture with JSON schema validation
@@ -118,6 +119,7 @@ Options:
   -p, --provider PROVIDER   AI provider to use: ollama or gemini (default: ollama)
   -m, --model MODEL         Model to use (default: gpt-oss for Ollama, gemini-flash-latest for Gemini)
   --api-key KEY             API key for Gemini provider (not needed for Ollama)
+  --sandbox MODE            Python sandbox mode: none or monty (default: none)
   -v, --verbose             Enable verbose mode for debugging
   -q, --quiet               Suppress all output except results
   -h, --help                Show help message
@@ -146,6 +148,46 @@ uvx --from git+https://github.com/CJHwong/operating-system-support oss "calculat
 # Interactive mode
 uvx --from git+https://github.com/CJHwong/operating-system-support oss
 ```
+
+## Monty Sandbox
+
+By default, Python code runs via `exec()` with full access to your system. The `--sandbox monty` flag runs Python code in a [pydantic-monty](https://github.com/pydantic/monty) sandbox instead — no filesystem access, no imports, no network, with enforced resource limits.
+
+```bash
+# Enable the sandbox
+oss --sandbox monty "calculate fibonacci numbers"
+
+# With alias
+uvx --from git+https://github.com/CJHwong/operating-system-support oss --sandbox monty "parse some JSON"
+```
+
+### What's restricted
+
+- `import` statements are disabled
+- No filesystem, network, or subprocess access
+- Resource limits: 30s execution timeout, 100 MB memory, 1M allocations
+
+### What's available
+
+Built-in functions (`len`, `sorted`, `min`, `max`, `sum`, `range`, `print`, etc.) and all `str`/`list`/`dict`/`set` methods work normally. Classes are not supported.
+
+A set of bridge functions provide safe access to common stdlib functionality:
+
+| Module | Bridge functions                                                                                                                                       |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `json` | `json_loads(s)`, `json_dumps(obj)`                                                                                                                     |
+| `math` | `math_sqrt(x)`, `math_ceil(x)`, `math_floor(x)`, `math_log(x, base)`, `math_pow(x, y)`, `math_pi()`, `math_e()`                                        |
+| `re`   | `re_search(pattern, string)`, `re_match(pattern, string)`, `re_findall(pattern, string)`, `re_sub(pattern, repl, string)`, `re_split(pattern, string)` |
+
+Bridge functions are called directly (e.g., `math_sqrt(16)` not `math.sqrt(16)`). The regex functions include ReDoS protection with a 5-second SIGALRM timeout and input size caps.
+
+### When to use it
+
+- Demo or shared environments where arbitrary code execution is unacceptable
+- When the task only needs computation, string processing, or data transformation
+- As defense-in-depth alongside user confirmation
+
+The sandbox does **not** restrict shell commands — those still require user confirmation as the primary security boundary.
 
 ## Security Considerations
 
