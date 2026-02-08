@@ -4,6 +4,7 @@
 # dependencies = [
 #   "ollama>=0.5.3",
 #   "google-genai>=1.42.0",
+#   "pydantic-monty>=0.0.4",
 # ]
 # ///
 import argparse
@@ -13,20 +14,24 @@ import inspect
 import io
 import json
 import locale
+import math
 import os
 import platform
+import re
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 import ollama
-from ollama import ResponseError as OllamaResponseError
+import pydantic_monty
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from ollama import ResponseError as OllamaResponseError
 
 DEFAULT_MODEL = 'gpt-oss'
 
@@ -73,6 +78,69 @@ class Provider(Enum):
 
     OLLAMA = 'ollama'
     GEMINI = 'gemini'
+
+
+class SandboxMode(Enum):
+    """Python interpreter sandbox mode."""
+
+    NONE = 'none'
+    MONTY = 'monty'
+
+
+class Sandbox(Protocol):
+    """Protocol for Python interpreter sandbox implementations.
+
+    Each sandbox owns its execution logic, system prompt note,
+    tool schema overrides, and display label.
+    """
+
+    @property
+    def label(self) -> str:
+        """Display label for the interpreter header (e.g. 'Python', 'Python/Monty')."""
+        ...
+
+    def get_system_note(self) -> str:
+        """Extra text appended to the system prompt. Empty string if none."""
+        ...
+
+    def get_tool_overrides(self) -> dict[str, dict[str, Any]] | None:
+        """Tool schema overrides, or None if no overrides needed."""
+        ...
+
+    def execute(self, code: str) -> dict[str, Any]:
+        """Execute code and return {'output': ...} or {'error': ...}."""
+        ...
+
+
+class ExecSandbox:
+    """Unsandboxed Python execution via exec()."""
+
+    @property
+    def label(self) -> str:
+        return 'Python'
+
+    def get_system_note(self) -> str:
+        return ''
+
+    def get_tool_overrides(self) -> dict[str, dict[str, Any]] | None:
+        return None
+
+    def execute(self, code: str) -> dict[str, Any]:
+        output_io = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output_io),
+            contextlib.redirect_stderr(output_io),
+        ):
+            try:
+                exec(code, {})
+                output = output_io.getvalue()
+                if not output:
+                    output = 'No output produced.'
+            except Exception as e:
+                error_output = output_io.getvalue()
+                return {'error': str(e), 'output': error_output}
+
+        return {'output': output}
 
 
 # ============================================================================
@@ -422,6 +490,30 @@ class ToolRegistry:
         """Get all tool definitions for the API."""
         return self._definitions
 
+    def update_tool_description(
+        self,
+        tool_name: str,
+        *,
+        description: str | None = None,
+        param_descriptions: dict[str, str] | None = None,
+    ) -> None:
+        """Override a registered tool's description and/or parameter descriptions.
+
+        Encapsulates the internal schema structure so callers don't need to
+        know the dict layout.  Raises KeyError if the tool isn't registered.
+        """
+        for defn in self._definitions:
+            if defn['function']['name'] == tool_name:
+                if description is not None:
+                    defn['function']['description'] = description
+                if param_descriptions:
+                    props = defn['function']['parameters'].get('properties', {})
+                    for param_name, param_desc in param_descriptions.items():
+                        if param_name in props:
+                            props[param_name]['description'] = param_desc
+                return
+        raise KeyError(f'Tool {tool_name!r} not registered')
+
     def execute_tool(self, tool_name: str, **kwargs) -> dict[str, Any]:
         """Execute a tool by name with given arguments."""
         if tool_name in self.tools:
@@ -611,6 +703,222 @@ class ConversationManager:
 
 
 # ============================================================================
+# Monty Sandbox
+# ============================================================================
+
+
+# Safety limits for bridged stdlib functions.
+# SIGALRM is process-global and main-thread-only.  This agent is single-
+# threaded (synchronous input() loop) so that's fine.  If the agent ever
+# goes multi-threaded, replace with threading.Timer or similar.
+_REGEX_TIMEOUT_SECS = 5
+_REGEX_MAX_PATTERN_LEN = 1_000
+_REGEX_MAX_INPUT_LEN = 100_000  # 100 KB
+_JSON_MAX_INPUT_LEN = 1_048_576  # 1 MB
+
+
+def _re_match_to_dict(m: re.Match | None) -> dict[str, Any] | None:
+    """Convert a re.Match object to a serializable dict for Monty."""
+    if m is None:
+        return None
+    return {
+        'group': m.group(),
+        'groups': list(m.groups()),
+        'start': m.start(),
+        'end': m.end(),
+        'span': list(m.span()),
+    }
+
+
+def _with_regex_timeout(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a regex function with SIGALRM timeout and input size checks.
+
+    Defends against ReDoS (exponential backtracking) and oversized inputs.
+    The timeout fires even if the regex engine is stuck in C code because
+    SIGALRM is delivered at the OS level.
+
+    Note: SIGALRM is process-global, main-thread-only.  Safe here because
+    this agent runs a synchronous input() loop on the main thread.
+    """
+
+    def wrapper(*args: Any) -> Any:
+        # args[0] is always the pattern
+        if args and isinstance(args[0], str) and len(args[0]) > _REGEX_MAX_PATTERN_LEN:
+            raise ValueError(f'Regex pattern too long ({len(args[0])} chars, max {_REGEX_MAX_PATTERN_LEN})')
+        # Check all string args after the pattern (re.sub has string at args[2])
+        for arg in args[1:]:
+            if isinstance(arg, str) and len(arg) > _REGEX_MAX_INPUT_LEN:
+                raise ValueError(f'Regex input too long ({len(arg)} chars, max {_REGEX_MAX_INPUT_LEN})')
+
+        def _alarm_handler(signum: int, frame: Any) -> None:
+            raise TimeoutError(f'Regex operation timed out after {_REGEX_TIMEOUT_SECS}s (possible ReDoS)')
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, _REGEX_TIMEOUT_SECS)
+        try:
+            return fn(*args)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    return wrapper
+
+
+def _safe_json_loads(s: str) -> Any:
+    """json.loads with input size cap to prevent host memory exhaustion."""
+    if len(s) > _JSON_MAX_INPUT_LEN:
+        raise ValueError(f'JSON input too long ({len(s)} bytes, max {_JSON_MAX_INPUT_LEN})')
+    return json.loads(s)
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    """json.dumps that rejects non-finite floats (inf/nan) per RFC 8259."""
+    return json.dumps(obj, allow_nan=False)
+
+
+# Safe regex wrappers: timeout + size checks around each re function.
+_safe_re_search = _with_regex_timeout(lambda pattern, string: _re_match_to_dict(re.search(pattern, string)))
+_safe_re_match = _with_regex_timeout(lambda pattern, string: _re_match_to_dict(re.match(pattern, string)))
+_safe_re_findall = _with_regex_timeout(re.findall)
+_safe_re_sub = _with_regex_timeout(re.sub)
+_safe_re_split = _with_regex_timeout(re.split)
+
+
+# External functions bridging host stdlib into the Monty sandbox.
+# Each entry: (monty_name, host_callable, type_stub_for_ty)
+MONTY_STDLIB_BRIDGE: list[tuple[str, Callable[..., Any], str]] = [
+    # json
+    ('json_loads', _safe_json_loads, 'def json_loads(s: str) -> Any: ...'),
+    ('json_dumps', _safe_json_dumps, 'def json_dumps(obj: Any) -> str: ...'),
+    # math (O(1), exceptions propagate cleanly — no wrapping needed)
+    ('math_sqrt', math.sqrt, 'def math_sqrt(x: float) -> float: ...'),
+    ('math_ceil', math.ceil, 'def math_ceil(x: float) -> int: ...'),
+    ('math_floor', math.floor, 'def math_floor(x: float) -> int: ...'),
+    ('math_log', math.log, 'def math_log(x: float, base: float = 2.718281828459045) -> float: ...'),
+    ('math_pow', math.pow, 'def math_pow(x: float, y: float) -> float: ...'),
+    ('math_pi', lambda: math.pi, 'def math_pi() -> float: ...'),
+    ('math_e', lambda: math.e, 'def math_e() -> float: ...'),
+    # re (all wrapped with SIGALRM timeout + size checks)
+    ('re_search', _safe_re_search, 'def re_search(pattern: str, string: str) -> dict | None: ...'),
+    ('re_match', _safe_re_match, 'def re_match(pattern: str, string: str) -> dict | None: ...'),
+    ('re_findall', _safe_re_findall, 'def re_findall(pattern: str, string: str) -> list: ...'),
+    ('re_sub', _safe_re_sub, 'def re_sub(pattern: str, repl: str, string: str) -> str: ...'),
+    ('re_split', _safe_re_split, 'def re_split(pattern: str, string: str) -> list: ...'),
+]
+
+
+def build_monty_external_functions() -> tuple[list[str], dict[str, Callable[..., Any]], str]:
+    """Build the external function names, callables, and type stubs for Monty.
+
+    Returns:
+        (function_names, function_map, type_stubs)
+    """
+    names = [name for name, _, _ in MONTY_STDLIB_BRIDGE]
+    callables = {name: fn for name, fn, _ in MONTY_STDLIB_BRIDGE}
+    stubs = '\n'.join(stub for _, _, stub in MONTY_STDLIB_BRIDGE)
+    return names, callables, stubs
+
+
+def run_monty_sandboxed(code: str) -> dict[str, Any]:
+    """Execute Python code in the Monty sandbox.
+
+    Returns a dict with 'output' on success or 'error' on failure.
+    """
+    fn_names, fn_map, _ = build_monty_external_functions()
+
+    try:
+        m = pydantic_monty.Monty(
+            code=code,
+            inputs=[],
+            external_functions=fn_names,
+            script_name='<sandbox>',
+        )
+    except pydantic_monty.MontyError as e:
+        return {'error': f'Sandbox parse error: {e}'}
+
+    print_lines: list[str] = []
+    try:
+        result = m.run(
+            external_functions=fn_map,
+            print_callback=lambda _stream, text: print_lines.append(text),
+            limits=pydantic_monty.ResourceLimits(
+                max_duration_secs=30.0,
+                max_memory=100 * 1024 * 1024,
+                max_allocations=1_000_000,
+            ),
+        )
+    except pydantic_monty.MontyError as e:
+        return {'error': f'Sandbox runtime error: {e}'}
+
+    output_parts = []
+    if print_lines:
+        output_parts.append(''.join(print_lines).rstrip('\n'))
+    if result is not None:
+        output_parts.append(str(result))
+    output = '\n'.join(output_parts) if output_parts else 'No output produced.'
+    return {'output': output}
+
+
+class MontySandbox:
+    """Sandboxed Python execution via pydantic-monty."""
+
+    @property
+    def label(self) -> str:
+        return 'Python/Monty'
+
+    def get_system_note(self) -> str:
+        fn_names = [name for name, _, _ in MONTY_STDLIB_BRIDGE]
+        return (
+            '\nIMPORTANT: The python_interpreter runs in a sandbox. '
+            'import statements are DISABLED and will fail. '
+            'Do NOT use import. Instead call these bridge functions directly:\n'
+            f'  {", ".join(fn_names)}\n'
+            'Example: json_loads(s) NOT json.loads(s), '
+            'math_sqrt(x) NOT math.sqrt(x), '
+            're_findall(pattern, string) NOT re.findall(pattern, string).'
+        )
+
+    def get_tool_overrides(self) -> dict[str, dict[str, Any]] | None:
+        _, _, type_stubs = build_monty_external_functions()
+
+        tool_desc = (
+            'Execute Python code in a sandboxed environment (Monty). '
+            'Standard library imports are NOT available. '
+            'Use the pre-defined bridge functions listed in the code parameter description. '
+            'Built-in functions (len, sorted, min, max, sum, enumerate, zip, range, print, etc.) '
+            'and all str/list/dict/set methods work normally. '
+            'Classes and import statements are NOT supported.'
+        )
+
+        code_param_desc = (
+            'The Python code to execute in the Monty sandbox.\n'
+            'Available bridge functions (call directly, no import needed):\n'
+            + type_stubs
+            + '\nRegex escaping: Do NOT use raw strings for regex patterns. '
+            'Use regular strings with double backslashes: "\\\\d" for digits, '
+            '"\\\\w" for word chars, "\\\\s" for whitespace. '
+            'Or use character classes: [0-9], [a-zA-Z0-9_], [ \\t\\n].'
+        )
+
+        return {
+            'python_interpreter': {
+                'description': tool_desc,
+                'param_descriptions': {'code': code_param_desc},
+            },
+        }
+
+    def execute(self, code: str) -> dict[str, Any]:
+        return run_monty_sandboxed(code)
+
+
+def create_sandbox(mode: SandboxMode) -> Sandbox:
+    """Factory: create the appropriate Sandbox for the given mode."""
+    if mode == SandboxMode.MONTY:
+        return MontySandbox()
+    return ExecSandbox()
+
+
+# ============================================================================
 # Main Agent
 # ============================================================================
 
@@ -626,9 +934,11 @@ class OSAgent:
         verbose: bool = False,
         quiet: bool = False,
         api_key: str | None = None,
+        sandbox: Sandbox | None = None,
     ):
         self.verbose = verbose
         self.quiet = quiet
+        self.sandbox: Sandbox = sandbox if sandbox is not None else ExecSandbox()
 
         # Initialize helper components
         self.tool_registry = ToolRegistry()
@@ -642,6 +952,8 @@ class OSAgent:
         )
 
         # Initialize conversation with system message
+        sandbox_note = self.sandbox.get_system_note()
+
         system_message = (
             self._get_env_info() + '\n'
             'You are an AI agent with access to the following tools: run_shell_command and python_interpreter. '
@@ -650,12 +962,20 @@ class OSAgent:
             'Examples:\n'
             "- If the user asks to list files in a directory, use run_shell_command with 'ls <directory>'.\n"
             '- If the user asks to calculate or process data using Python, use python_interpreter with the appropriate code.\n'
-            '- For general questions or when tools are not applicable, respond directly.'
+            '- For general questions or when tools are not applicable, respond directly.' + sandbox_note
         )
         self.conversation_manager.initialize_conversation(system_message)
 
-        # Register tools from this instance
+        # Register tools, then apply sandbox-specific tool schema overrides
         self.tool_registry.register_tools_from_instance(self)
+        overrides = self.sandbox.get_tool_overrides()
+        if overrides:
+            for tool_name, override in overrides.items():
+                self.tool_registry.update_tool_description(
+                    tool_name,
+                    description=override.get('description'),
+                    param_descriptions=override.get('param_descriptions'),
+                )
 
     def _get_env_info(self) -> str:
         """Generate environment information string."""
@@ -752,28 +1072,15 @@ class OSAgent:
     @tool('Execute Python code.', {'code': 'The Python code to execute.'})
     def python_interpreter(self, code: str) -> dict:
         """Execute Python code with user confirmation."""
-        print(f'\n>>> Python({repr(code)})')
+        print(f'\n>>> {self.sandbox.label}({repr(code)})')
         if not self.command_approver.confirm_python_code():
             return {'error': 'Command cancelled by user'}
 
-        output_io = io.StringIO()
-        with (
-            contextlib.redirect_stdout(output_io),
-            contextlib.redirect_stderr(output_io),
-        ):
-            try:
-                exec(code, {})
-                output = output_io.getvalue()
-                if not output:
-                    output = 'No output produced.'
-            except Exception as e:
-                error_output = output_io.getvalue()
-                full_error = f'{str(e)}\n{error_output}' if error_output else str(e)
-                self._print_tool_output(full_error)
-                return {'error': str(e), 'output': error_output}
+        result = self.sandbox.execute(code)
 
+        output = result.get('output') or result.get('error', 'No output produced.')
         self._print_tool_output(output)
-        return {'output': output}
+        return result
 
     def _process_query(self, query: str) -> tuple[int, str]:
         """Process a user query through the conversation manager and tool registry."""
@@ -910,6 +1217,12 @@ def main():
         default=os.environ.get('GEMINI_API_KEY'),
         help='API key for Gemini provider. Can also be set via GEMINI_API_KEY env var. Not needed for Ollama.',
     )
+    parser.add_argument(
+        '--sandbox',
+        choices=['none', 'monty'],
+        default='none',
+        help='Python interpreter sandbox mode (default: none). "monty" uses pydantic-monty for sandboxed execution.',
+    )
     args = parser.parse_args()
 
     # Validate quiet flag usage
@@ -930,6 +1243,9 @@ def main():
     if provider == Provider.GEMINI and not args.api_key:
         parser.error('Gemini provider requires an API key. Use --api-key or set GEMINI_API_KEY env var.')
 
+    sandbox_mode = SandboxMode.MONTY if args.sandbox == 'monty' else SandboxMode.NONE
+    sandbox = create_sandbox(sandbox_mode)
+
     agent = OSAgent(
         provider=provider,
         model=model,
@@ -937,6 +1253,7 @@ def main():
         verbose=args.verbose,
         quiet=args.quiet,
         api_key=args.api_key,
+        sandbox=sandbox,
     )
     agent.run(initial_query=args.query)
 
