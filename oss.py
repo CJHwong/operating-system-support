@@ -830,6 +830,8 @@ def run_monty_sandboxed(code: str) -> dict[str, Any]:
         )
     except pydantic_monty.MontyError as e:
         return {'error': f'Sandbox parse error: {e}'}
+    except Exception as e:
+        return {'error': f'Sandbox internal error during parse: {e}'}
 
     print_lines: list[str] = []
     try:
@@ -844,6 +846,8 @@ def run_monty_sandboxed(code: str) -> dict[str, Any]:
         )
     except pydantic_monty.MontyError as e:
         return {'error': f'Sandbox runtime error: {e}'}
+    except Exception as e:
+        return {'error': f'Sandbox internal error: {e}'}
 
     output_parts = []
     if print_lines:
