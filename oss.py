@@ -819,13 +819,12 @@ def run_monty_sandboxed(code: str) -> dict[str, Any]:
 
     Returns a dict with 'output' on success or 'error' on failure.
     """
-    fn_names, fn_map, _ = build_monty_external_functions()
+    _, fn_map, _ = build_monty_external_functions()
 
     try:
         m = pydantic_monty.Monty(
             code=code,
             inputs=[],
-            external_functions=fn_names,
             script_name='<sandbox>',
         )
     except pydantic_monty.MontyError as e:
